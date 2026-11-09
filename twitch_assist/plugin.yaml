@@ -1,0 +1,39 @@
+name: twitch-assist
+label: Twitch
+kind: platform
+version: 0.1.0
+description: >
+  Twitch chat platform adapter for Hermes Agent. Joins a streamer's Twitch chat as a co-host and
+  answers viewers who address it with !ask or an @mention. Stdlib only (asyncio IRC over TLS).
+  Twitch-originated turns are limited to web search; viewers cannot run gateway commands.
+author: Techkeyy
+requires_env:
+  - name: TWITCH_TOKEN
+    description: "Twitch chat OAuth token with chat:read and chat:edit"
+    prompt: "Twitch OAuth token"
+    password: true
+  - name: TWITCH_CHANNEL
+    description: "Twitch channel to join (without #)"
+    prompt: "Twitch channel"
+    password: false
+optional_env:
+  - name: TWITCH_BOT_USERNAME
+    description: "Login of the bot account (default: the login the token belongs to, else the channel)"
+    prompt: "Bot username"
+    password: false
+  - name: TWITCH_TRIGGER
+    description: "Chat trigger that addresses the bot (default: !ask). An @mention of the bot also works."
+    prompt: "Trigger"
+    password: false
+  - name: TWITCH_COOLDOWN_SECONDS
+    description: "Per-viewer cooldown between questions in seconds (default: 20)"
+    prompt: "Cooldown seconds"
+    password: false
+  - name: TWITCH_ALLOW_ALL_USERS
+    description: "Let any viewer talk to the bot (default: true; tools are limited to web search)"
+    prompt: "Allow all viewers? (true/false)"
+    password: false
+  - name: TWITCH_ALLOWED_USERS
+    description: "Comma-separated Twitch user IDs allowed to talk to the bot (used when TWITCH_ALLOW_ALL_USERS=false)"
+    prompt: "Allowed user IDs"
+    password: false
