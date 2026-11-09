@@ -6,7 +6,7 @@ variation selectors removed, whitespace collapsed), never as substrings, so a re
 a phrase is not touched. Only used for text that arrives while a turn this adapter dispatched is pending;
 anything outside a pending turn is dropped structurally (see ``TwitchAdapter.send``).
 
-``tests/test_notices.py`` re-derives the list from the installed Hermes catalog and fails on drift.
+``test_notice_templates_cover_the_installed_hermes_catalog`` (tests/test_rescue.py) re-derives the list from the installed Hermes catalog and fails on drift.
 Notices in other UI languages are not matched by text, only by the structural pending-turn rule.
 """
 

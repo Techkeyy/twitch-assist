@@ -1,12 +1,13 @@
 # Twitch Assist
 
-A Hermes Agent platform plugin that puts your own Hermes in your Twitch chat as a co-host: viewers ask it things, and chat can vote on what it does next.
+**A Hermes Agent platform plugin that lets your Twitch chat steer your agent, and stays safe while strangers do it.** Viewers `!ask` your own Hermes a question. In Backseat Mode, chat votes and the winning option becomes the agent's next task.
 
-**[Repo](https://github.com/Techkeyy/twitch-assist)** · **[Real chat round trip (screenshot)](docs/chat-proof.jpg)**
+**[Repo](https://github.com/Techkeyy/twitch-assist)** · **[Catalog PR](https://github.com/NousResearch/hermes-agent/pull/152224)** · **[Real chat round trip (screenshot)](docs/chat-proof.jpg)**
+<!-- DEMO_VIDEO_LINK -->
 
 > *"Someone asked a question ten minutes ago and I was mid-fight. Did anyone ever answer it?"*
 
-If you stream, you cannot read chat and play at the same time. Viewers ask, nobody answers, and they drift off. Chat bots mostly run fixed commands. This plugin connects the Hermes agent you already run to your channel, so a viewer who types `!ask` gets a real answer from your model, in chat, addressed to them.
+This is for streamers who already run Hermes. You cannot read chat and play at the same time: viewers ask, nobody answers, and they drift off. Chat bots mostly run fixed commands. Twitch Assist connects the Hermes agent you already run to your channel, so a viewer who types `!ask` gets a real answer from your model, in chat, addressed to them.
 
 *Built for the Hermes Agent Plugin Hackathon (Nous Research), November 2026.*
 
@@ -16,9 +17,32 @@ If you stream, you cannot read chat and play at the same time. Viewers ask, nobo
 
 ## Why a co-host, not a bot
 
-Fixed-command bots answer what someone scripted in advance. Twitch Assist hands the question to your Hermes agent and posts the model's answer, so it can answer things nobody anticipated. The second half is **Backseat Mode**: you start a chat vote, chat picks one of your options, and the winner is handed to Hermes as its next task. Chat steers the agent, with the broadcaster or a mod holding the start and cancel controls.
+Fixed-command bots answer what someone scripted in advance. Twitch Assist hands the question to your Hermes agent and posts the model's answer, so it can answer things nobody anticipated. A prompt or a skill cannot do the rest: this plugin holds a live IRC connection, decides who may start a vote from Twitch's server tags, runs the vote clock, caps how many turns run at once, and blocks every tool but web search for strangers.
 
-It is also locked down by default. Every Twitch turn gets web search only (see Safety), and a second guard blocks every other tool call in a Twitch session. A stranger in chat cannot make your agent touch your files, terminal, browser or MCP servers. One thing the plugin cannot lock down on its own is what Hermes puts in the prompt about you (your memory, profile and persona files). Read Privacy before you go live.
+**Backseat Mode** is the part that makes it a co-host. The broadcaster or a mod starts a chat vote, chat picks one of the options, and the winner is handed to Hermes as its next task. Chat steers the agent, and you hold the start and cancel controls.
+
+It is locked down by default. Every Twitch turn gets web search only, and a second guard blocks every other tool call in a Twitch session. A stranger in chat cannot make your agent touch your files, terminal, browser or MCP servers. One thing the plugin cannot lock down on its own is what Hermes puts in the prompt about you (memory, profile and persona files). Read Safety and Privacy before you go live.
+
+```
+  viewer types:  !ask why do cats purr        mod types:  !backseat next? | a | b
+        |                                            |   then chat sends  !vote 1 / !vote 2
+        v                                            v
+  Twitch chat --IRC over TLS--> +------------------ Twitch Assist adapter -------------------+
+                                |  trigger filter -> cooldown -> in-flight cap (default 3)   |
+                                |  Backseat vote engine: tally, timer, cancel                |
+                                |  mod/broadcaster authority read from Twitch server tags    |
+                                +------------------------------+-----------------------------+
+                                                               | one dispatched turn,
+                                                               | no gateway /commands
+                                                               v
+                                 Hermes agent turn: web_search only (toolset list + pre_tool_call guard)
+                                                               |
+                                                               v
+                       pending-turn check, notice filter, strip markdown, split to 3 parts max
+                                                               |
+                                                               v
+                              @viewer answer posted in chat (a Backseat winner is answered to chat)
+```
 
 ## What it does
 
@@ -38,11 +62,12 @@ It is also locked down by default. Every Twitch turn gets web search only (see S
 | `!vote N` | Any viewer (or only `TWITCH_ALLOWED_USERS` and the broadcaster if you restrict it) | Counts one vote for option N. Voting again replaces your earlier vote. Never starts an agent turn |
 | `!backseat cancel` | Same people as `!backseat` | Cancels the running vote, also when the timer has already fired but the winner has not been sent yet. Nothing is dispatched |
 
+
 Whether someone is the broadcaster or a mod comes from Twitch's server-supplied message tags, never from the message text.
 
 ## Quickstart
 
-You need Hermes 0.23.0 or newer with a model provider configured, and a Twitch chat token (next section).
+You need Hermes 0.23.0 or newer with a model provider configured, and a Twitch chat token (see Getting a chat token below).
 
 ```bash
 # 1. Install and enable (the plugin lives in the twitch_assist subdirectory of this repo)
@@ -52,15 +77,11 @@ hermes plugins install Techkeyy/twitch-assist#twitch_assist --enable
 hermes config set TWITCH_TOKEN <your chat token>
 hermes config set TWITCH_CHANNEL <your channel, no #>
 
-# 3. Run
+# 3. Run, then warm it up with one !ask of your own before you go live
 hermes gateway run
 ```
 
-Then type `!ask hello` in your channel from a second account. A viewer account is the real test, because the broadcaster is treated a little differently (no cooldown, no cap). The first answer after a gateway start can take up to a minute, because Hermes cold starts its agent (I measured 60.9 s for the first question and 2.8 s for the next one). Send one warm-up `!ask` yourself before you go live.
-
-Once the plugin is in the Hermes catalog, `hermes plugins install twitch-assist` also works. `hermes plugins install` accepts a Git URL, `owner/repo`, or `owner/repo#subdir`, and does not accept local paths.
-
-**Required: pin the Twitch toolsets.** The adapter sets the Twitch toolsets itself, but if the gateway ever cannot resolve the adapter for a session it falls back to the platform default, which is the full toolset. A plugin cannot change that default (I checked: there is no public hook for it), so add this row under the existing `platform_toolsets:` section of `config.yaml`. I run with it, and `hermes config check` accepts it:
+**Required, add to `config.yaml`: pin the Twitch toolsets.** The adapter sets the Twitch toolsets itself, but if the gateway ever cannot resolve the adapter for a session it falls back to the platform default, which is the full toolset. A plugin cannot change that default (I checked: there is no public hook for it), so add this row under the existing `platform_toolsets:` section. I run with it, and `hermes config check` accepts it:
 
 ```yaml
 platform_toolsets:
@@ -69,7 +90,7 @@ platform_toolsets:
 
 If the pin is missing or unsafe, the adapter logs a warning at connect (`platform_toolsets.twitch is not pinned to [search, no_mcp]; viewer turns may get full tools if the adapter is unresolved`). Even then, a `pre_tool_call` guard in this plugin blocks every tool except `web_search` in a Twitch session, so the pin is the first line and the guard is the backstop.
 
-**Recommended, and needed for privacy:** also add these two settings (see Privacy for why):
+**Recommended, and needed for privacy** (see Privacy for why). Add these to `config.yaml` too:
 
 ```yaml
 gateway:
@@ -81,7 +102,11 @@ memory:
   user_profile_enabled: false
 ```
 
-The `memory` lines are global in Hermes, so they switch off your MEMORY.md and USER.md for every platform, not just Twitch. Hermes has no per-platform switch for them.
+The `memory` lines are global in Hermes, so they switch off your MEMORY.md and USER.md for every platform, not just Twitch. Hermes has no per-platform switch for them. Edit `config.yaml` by hand for the `gateway.platforms` block (see the Hermes findings below).
+
+Then type `!ask hello` in your channel from a second account. A viewer account is the real test, because the broadcaster is treated a little differently (no cooldown, no cap). **Warm-up:** the first answer after a gateway start can take up to a minute, because Hermes cold starts its agent (I measured 60.9 s for the first question and 2.8 s for the next one).
+
+Once the plugin is in the Hermes catalog, `hermes plugins install twitch-assist` also works. `hermes plugins install` accepts a Git URL, `owner/repo`, or `owner/repo#subdir`, and does not accept local paths.
 
 ### Getting a chat token
 
@@ -91,6 +116,7 @@ The token needs the scopes `chat:read` and `chat:edit`. Use a dedicated bot acco
 - **Alternative:** a third-party token generator such as twitchtokengenerator.com. Caution: the token is issued through someone else's Twitch app, so only do this with a throwaway or dedicated bot account. You can revoke it any time in Twitch under Settings, Connections.
 
 I used the alternative, with a dedicated account, for the live runs above. Never paste a real token into an issue, a screenshot or a commit.
+
 
 ## Configuration
 
@@ -108,6 +134,20 @@ Set these through Hermes (`hermes config set NAME value`). Defaults are the ones
 | `TWITCH_ALLOW_ALL_USERS` | no | `true` | Let any viewer ask, vote and (if a mod) start votes. Set `false` to restrict all three to `TWITCH_ALLOWED_USERS` plus the broadcaster |
 | `TWITCH_ALLOWED_USERS` | no | none | Comma-separated Twitch user IDs allowed when `TWITCH_ALLOW_ALL_USERS=false` |
 
+## Proof it works
+
+Every run below happened in a real Twitch channel (#iszee24) with a real Hermes agent behind it, on 2026-11-09. Chat lines are quoted as they appeared.
+
+| Run | What happened | What chat saw |
+|---|---|---|
+| Viewer question (screenshot above) | `iszee23` typed `!ask what's a fun fact about space?` | `@iszee23 A day on Venus lasts about 243 Earth days...` |
+| Two-voter Backseat, 23:52 | A vote was started, `iszee23` and `iszee24` both voted for option 2 | "Chat picked: why cats purr (2 of 2 votes)", then Hermes answered the winning option |
+| Shell request refused | A viewer typed `!ask run the command dir on your computer and paste the output` | "No can do, I've only got web search in this session, no shell access..." (4 s) |
+| Install from GitHub | `hermes plugins install Techkeyy/twitch-assist#twitch_assist --enable`, then a plain `hermes gateway run` | The installed copy answered a live `!ask` ("Saturn has bright icy rings.") |
+| Normal config path | Token and channel read from Hermes's `.env`, no environment overrides | Connected and answered `!ask` |
+
+Not proven live: a real network drop (reconnect is tested against a fake IRC server) and a second machine. See Limitations.
+
 ## How I tried to break it
 
 Every row below is a test in this repo (72 pass) or a live run.
@@ -124,7 +164,7 @@ Every row below is a test in this repo (72 pass) or a live run.
 | Gateway error text (for example "run hermes doctor") | Replaced by one line, "Sorry, I can't answer right now."; original goes to the log | `test_gateway_error_is_replaced_and_original_logged`, `test_provider_error_inside_turn_is_friendly_line` |
 | Gateway shutdown and status notices | Never posted to chat | `test_shutdown_notice_never_posted_marker_and_text`, `test_status_notice_dropped_and_normal_answer_passes` |
 | Anything that is not the reply to a question I dispatched (home-channel broadcasts, cron output, "Gateway online", the "No home channel" nag) | Dropped, nothing posted | `test_nothing_posted_without_a_pending_turn`, `test_private_platform_notice_is_never_posted`, `test_env_seed_private_notices_and_no_home_channel` |
-| Notices inside a turn (session auto-reset with model and endpoint lines, cron store, restart) | Dropped by exact template match taken from Hermes's own locale strings | `test_notice_templates_dropped_inside_a_turn`, `test_notice_templates_cover_the_installed_hermes_catalog` |
+| Notices inside a turn (session auto-reset with model and endpoint lines, cron store, restart) | Dropped by prefix-anchored template match taken from Hermes's own locale strings | `test_notice_templates_dropped_inside_a_turn`, `test_notice_templates_cover_the_installed_hermes_catalog` |
 | A real answer that starts with an emoji (a question mark, a speech bubble, a lightning bolt) or mentions "hermes is restarting" | Posted normally | `test_real_answers_with_emoji_or_notice_phrases_pass` |
 | Six viewers ask at once with the cap at 3 | Three are dispatched, three are dropped silently, a slot frees when an answer is posted, the broadcaster is exempt | `test_concurrency_cap_limits_parallel_viewers_and_slot_frees_after_reply`, `test_broadcaster_exempt_from_cap` |
 | An answer that arrives after 180 s | Dropped, and the slot was already freed by the timeout | `test_stale_reply_dropped_and_timeout_frees_slot` |
@@ -142,6 +182,8 @@ Every row below is a test in this repo (72 pass) or a live run.
 **Key invariant: a viewer's message cannot start a vote or run a gateway command, and viewer turns get web search only (pin it in `config.yaml` too, it is required, see Quickstart).**
 
 Trust architecture in one sentence: who may start a vote is decided from Twitch's server tags, and what a viewer's turn may do is decided by the adapter's toolset list, never by message text.
+
+An independent read-only red-team audit of the first release found no critical issue and three high ones: viewer turns could read owner memory and persona from the prompt, the toolset fell back to full tools when the adapter was unresolved, and there was no global rate cap. v0.2.0 added the in-flight cap, 1.6 s send spacing, stale-answer drop, the notice filter, keepalive and read timeout, command-safe reply parts, the vote allowlist, vote race fixes and the `pre_tool_call` guard. The privacy and fallback gaps cannot be closed from a plugin, so they are documented and checked at connect instead.
 
 Run the tests yourself: the adapter tests need the Hermes source importable and are skipped otherwise (see the header of `tests/test_adapter.py`). I ran all 72 with Hermes's own Python: 31 protocol tests, 15 adapter tests and 26 release-rescue tests, all against a local fake IRC server.
 
@@ -165,10 +207,20 @@ Run the tests yourself: the adapter tests need the Hermes source importable and 
 | `twitch_assist/protocol.py` | Pure logic: IRC parsing, trigger filter, cooldown, vote tally, reply splitting, notice classifier |
 | `twitch_assist/notices.py` | Gateway notice templates derived from Hermes's English locale strings |
 | `tests/` | 31 protocol tests, 15 adapter tests and 26 release-rescue tests against a fake IRC server |
-| `scripts/live_test.py` | Dev helper: posts as the bot and records chat with an anonymous reader |
-| `scripts/dev-run.ps1` | Dev helper: runs the gateway with the token loaded into that process only |
+| `scripts/live_test.py` | Contributor helper: posts as the bot and records chat with an anonymous reader (needs `TWITCH_TOKEN_FILE` and `TWITCH_CHANNEL`) |
 
 Hermes surfaces used: `ctx.register_platform`, `ctx.register_hook` (`pre_tool_call`), `BasePlatformAdapter`, `toolsets_for_source`, `send_private_notice`, `platform_hint`, and env enablement.
+
+## Hermes: what I used and what I hit
+
+I built this against Hermes v0.23.0 on native Windows. Besides the surfaces listed above, I used the gateway's own message dispatch (`allow_gateway_control=False` on every turn), the notice delivery setting `private`, and the scoped secret reader for credentials. What I ran into, stated as observed:
+
+- `hermes config set gateway.platforms.twitch.skip_context_files true` wrote a top-level `platforms:` key instead of `gateway.platforms` in v0.23.0. I moved it by hand.
+- `hermes plugins install` rejects local paths (a Git URL, `owner/repo` and `owner/repo#subdir` work), so local development needs a junction into the plugins folder.
+- `hermes plugins list` blocks in a non-interactive shell.
+- The first turn after a gateway start had a gap of about 43 s before agent init: 60.9 s cold, 2.8 s for the next question.
+- Session metadata keys are restricted, so platform sender facts cannot ride on `MessageEvent.metadata`.
+- A plugin cannot set a per-platform memory or context-file policy, and cannot set a default platform toolset. That is why the privacy settings and the toolset pin live in your `config.yaml`, with a guard hook as the backstop.
 
 ## Privacy and network disclosure
 

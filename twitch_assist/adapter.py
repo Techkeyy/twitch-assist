@@ -171,7 +171,7 @@ class TwitchAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("Twitch: failed to connect to %s:%s: %s", IRC_HOST, IRC_PORT, e)
             return self._fail("connect_failed", str(e), retryable=True)
-        await self._send_raw(f"PASS oauth:{token}", secret=True)
+        await self._send_raw(f"PASS oauth:{token}")
         await self._send_raw(f"NICK {self.bot_login}")
         await self._send_raw("CAP REQ :twitch.tv/tags twitch.tv/commands")
         self._recv_task = asyncio.create_task(self._receive_loop())
@@ -308,7 +308,7 @@ class TwitchAdapter(BasePlatformAdapter):
         ``platform_toolsets.twitch`` / the implicit ``hermes-twitch`` core bundle)."""
         return list(SAFE_TOOLSETS)
 
-    async def _send_raw(self, line: str, *, secret: bool = False) -> None:
+    async def _send_raw(self, line: str) -> None:
         if not self._writer or self._writer.is_closing():
             return
         line = line.replace("\r", " ").replace("\n", " ")
