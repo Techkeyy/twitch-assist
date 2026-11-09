@@ -12,10 +12,22 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Optional
 
+try:
+    from . import notices
+except ImportError:  # loaded straight from its file (tests, no package context)
+    import importlib.util as _ilu
+    import pathlib as _pl
+    import sys as _sys
+
+    _spec = _ilu.spec_from_file_location("twitch_notices", _pl.Path(__file__).with_name("notices.py"))
+    notices = _ilu.module_from_spec(_spec)
+    _sys.modules["twitch_notices"] = notices
+    _spec.loader.exec_module(notices)
+
 TWITCH_MAX_CHARS = 500          # hard Twitch limit per chat message
 CHUNK_LIMIT = 480               # we stay under it
 MAX_PARTS = 3                   # at most this many chat messages per reply
-MIN_SEND_INTERVAL = 1.1         # seconds between our messages (Twitch rate limit)
+MIN_SEND_INTERVAL = 1.6         # seconds between our messages (Twitch non-mod limit: 20 messages per 30 s)
 
 _TAG_UNESCAPE = {":": ";", "s": " ", "\\": "\\", "r": "\r", "n": "\n"}
 
@@ -210,21 +222,30 @@ def to_plain_text(text: str) -> str:
     return " ".join(text.split())
 
 
+_LEADING_COMMAND_CHARS = re.compile(r"^[/.!\s]+")
+
+
+def _no_command_start(text: str) -> str:
+    """Strip leading ``/``, ``.``, ``!`` and whitespace so no chat message can start as a Twitch/bot command."""
+    return _LEADING_COMMAND_CHARS.sub("", text)
+
+
 def split_message(content: str, reply_user: Optional[str] = None, *,
                   limit: int = CHUNK_LIMIT, max_parts: int = MAX_PARTS) -> list:
     """Plain-text ``content`` into at most ``max_parts`` chat messages of <= ``limit`` chars.
 
-    The first message is prefixed with ``@reply_user`` when given. If the text does not fit,
-    the last part is cut with an ellipsis. Returns [] for empty content.
+    Every part is prefixed with ``@reply_user`` when given, and no part ever starts with ``/``, ``.`` or ``!``
+    (model output must not be able to issue a chat or bot command). If the text does not fit, the last part is
+    cut with an ellipsis. Returns [] for empty content.
     """
-    text = to_plain_text(content)
+    text = _no_command_start(to_plain_text(content))
     if not text:
         return []
     prefix = f"@{reply_user} " if reply_user else ""
+    room = limit - len(prefix)
     parts: list = []
     remaining = text
     while remaining and len(parts) < max_parts:
-        room = limit - (len(prefix) if not parts else 0)
         if len(remaining) <= room:
             parts.append(remaining)
             remaining = ""
@@ -233,16 +254,13 @@ def split_message(content: str, reply_user: Optional[str] = None, *,
         if cut < room // 3:
             cut = room
         parts.append(remaining[:cut].rstrip())
-        remaining = remaining[cut:].lstrip()
+        remaining = _no_command_start(remaining[cut:])
     if remaining:  # truncated
         last = parts[-1]
-        if len(last) > limit - 1:
-            last = last[: limit - 1].rstrip()
+        if len(last) > room - 1:
+            last = last[: room - 1].rstrip()
         parts[-1] = last + "…"
-        # the ellipsis char counts as one char; Twitch limit is by characters
-    if prefix:
-        parts[0] = prefix + parts[0]
-    return parts
+    return [prefix + p for p in parts if p]
 
 
 # -- Backseat Mode (chat votes) ----------------------------------------------
@@ -366,23 +384,32 @@ def build_backseat_task(prompt: str, option: str) -> str:
 # -- gateway notices that must not reach public chat ---------------------------
 
 FRIENDLY_ERROR_TEXT = "Sorry, I can't answer right now."
-# Hermes gateway notices all come from locale strings that start with a status emoji (the strings carry
-# no metadata flag). Errors become the friendly line; pure status/progress pings are dropped.
-_NOTICE_ERROR_MARKERS = ("⚠", "⛔", "⏱", "📬")                  # warning, no entry, stopwatch, mailbox
-_NOTICE_SILENT_MARKERS = ("⏳", "⏩", "↪", "⚡", "♻", "▶", "⏸",
-                          "🟡", "❓", "↩", "💬")             # hourglass, steer, redirect, bolt, recycle, play/pause...
-_NOTICE_LIFECYCLE_PHRASES = ("hermes is shutting down", "hermes is restarting", "gateway online")
-_NOTICE_ERROR_PHRASES = ("sorry, i encountered an error",)
+_ERROR_LEADS = ("⚠", "⏱", "⛔")   # warning, stopwatch, no entry: a failed turn, shown as the friendly line
+# gateway.shutdown.* / gateway.startup.*: lifecycle and maintenance, never about this viewer's question
+_LIFECYCLE_SILENT = ("⚠ Hermes is shutting down", "⚠ Hermes is restarting", "⚠ Scheduled job", "⚠ Session database")
+
+
+def _norm_notice(text: str) -> str:
+    return " ".join((text or "").replace("️", "").split())
 
 
 def classify_gateway_notice(text: str) -> Optional[str]:
-    """"error" | "silent" | None (a normal answer) for text about to be posted to chat."""
-    t = (text or "").lstrip()
-    low = t.lower()
-    if any(x in low for x in _NOTICE_LIFECYCLE_PHRASES):
-        return "silent"
-    if t.startswith(_NOTICE_ERROR_MARKERS) or any(low.startswith(p) for p in _NOTICE_ERROR_PHRASES):
+    """"error" | "silent" | None (a normal answer) for text that arrives while a turn is pending.
+
+    Prefix-anchored match against the English gateway templates in ``notices.py`` (derived from Hermes's
+    ``locales/en.yaml``). Substrings and bare leading emoji never classify: a real answer that starts with
+    an emoji, or that mentions a notice phrase, passes. Whether text may be posted AT ALL is decided
+    structurally (a turn this adapter dispatched must be pending), not here.
+    """
+    t = _norm_notice(text)
+    if not t:
+        return None
+    if t.startswith(notices.PLAIN_ERROR_PREFIXES):
         return "error"
-    if t.startswith(_NOTICE_SILENT_MARKERS):
+    if t.startswith(notices.SYMBOL_PREFIXES):
+        if t.startswith(_LIFECYCLE_SILENT):
+            return "silent"
+        return "error" if t.startswith(_ERROR_LEADS) else "silent"
+    if t.startswith(notices.PLAIN_SILENT_PREFIXES):
         return "silent"
     return None

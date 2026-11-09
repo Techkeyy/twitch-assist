@@ -43,6 +43,8 @@ class FakeIRC:
         self.auth_ok = auth_ok
         self.connections = 0
         self.posted = []          # PRIVMSG texts the bot sent
+        self.lines = []           # every raw line the bot sent
+        self.answer_ping = True
         self._writers = []
         self._server = None
         self.port = 0
@@ -59,6 +61,9 @@ class FakeIRC:
                 line = (await reader.readline()).decode().rstrip("\r\n")
                 if not line:
                     break
+                self.lines.append(line)
+                if line.startswith("PING") and self.answer_ping:
+                    writer.write(b":tmi.twitch.tv PONG tmi.twitch.tv :tmi.twitch.tv\r\n")
                 if line.startswith("NICK"):
                     if self.auth_ok:
                         writer.write(b":tmi.twitch.tv 001 bot :Welcome, GLHF!\r\n")
@@ -73,7 +78,8 @@ class FakeIRC:
             pass
 
     async def say(self, user, text, *, uid=None, badges="", mod=0, chan="chan"):
-        raw = (f"@badges={badges};display-name={user.title()};id=m{len(text)}{id(text) % 9999};mod={mod};"
+        self.seq = getattr(self, "seq", 0) + 1
+        raw = (f"@badges={badges};display-name={user.title()};id=m{self.seq};mod={mod};"
                f"user-id={uid or user} :{user}!{user}@{user}.tmi.twitch.tv PRIVMSG #{chan} :{text}\r\n")
         for w in self._writers:
             w.write(raw.encode())
@@ -104,6 +110,7 @@ def env(monkeypatch):
     monkeypatch.setattr(ad, "IRC_TLS", False)
     monkeypatch.setattr(ad, "_validate_token_sync", lambda token: ("ok", "bot"))
     monkeypatch.setattr(ad, "MIN_SEND_INTERVAL", 0.0)
+    monkeypatch.setattr(ad, "_warn_unsafe_config", lambda: None)  # never read the real Hermes config in tests
 
 
 def make_adapter(monkeypatch, port, cooldown=20, vote_seconds=1.0):
@@ -124,6 +131,14 @@ def make_adapter(monkeypatch, port, cooldown=20, vote_seconds=1.0):
     return a
 
 
+async def ask(srv, a, user="boss", text="!ask hi", **kw):
+    """A viewer asks; returns the dispatched event (its message_id is the reply_to Hermes will use)."""
+    n = len(a.events)
+    kw.setdefault("uid", user)
+    await srv.say(user, text, **kw)
+    return a.events[-1] if len(a.events) > n else None
+
+
 async def up(monkeypatch, **kw):
     srv = FakeIRC(auth_ok=kw.pop("auth_ok", True))
     await srv.start()
@@ -137,8 +152,9 @@ async def up(monkeypatch, **kw):
 async def test_gateway_error_is_replaced_and_original_logged(env, monkeypatch, caplog):
     srv, a = await up(monkeypatch)
     assert await a.connect()
+    ev = await ask(srv, a)
     with caplog.at_level(logging.WARNING):
-        res = await a.send("chan", ERR, reply_to="whatever")
+        res = await a.send("chan", ERR, reply_to=ev.message_id)
     assert res.success
     await asyncio.sleep(0.1)
     assert srv.posted == ["Sorry, I can't answer right now."]
@@ -153,10 +169,11 @@ async def test_gateway_error_is_replaced_and_original_logged(env, monkeypatch, c
 async def test_status_notice_dropped_and_normal_answer_passes(env, monkeypatch):
     srv, a = await up(monkeypatch)
     assert await a.connect()
-    assert (await a.send("chan", "⚡ Interrupting current task. I'll respond shortly.")).success
-    assert (await a.send("chan", "Twitch is a live streaming platform.")).success
+    ev = await ask(srv, a)
+    assert (await a.send("chan", "⚡ Interrupting current task. I'll respond shortly.", reply_to=ev.message_id)).success
+    assert (await a.send("chan", "Twitch is a live streaming platform.", reply_to=ev.message_id)).success
     await asyncio.sleep(0.1)
-    assert srv.posted == ["Twitch is a live streaming platform."]
+    assert srv.posted == ["@Boss Twitch is a live streaming platform."]
     await a.disconnect()
     await srv.stop()
 
@@ -165,15 +182,16 @@ async def test_status_notice_dropped_and_normal_answer_passes(env, monkeypatch):
 async def test_shutdown_notice_never_posted_marker_and_text(env, monkeypatch, caplog):
     srv, a = await up(monkeypatch)
     assert await a.connect()
+    ev = await ask(srv, a)
     shutdown = ("⚠️ Hermes is shutting down — your current task will be interrupted. When it is back online, "
                 "send any message and I'll try to pick up where we left off.")
     with caplog.at_level(logging.INFO):
         # as Hermes sends it: structural interim marker (gateway/run_shutdown.py _send_notice_logged)
-        assert (await a.send("chan", shutdown, metadata={"_interim_send": True})).success
-        # same text without any marker (text fallback)
-        assert (await a.send("chan", shutdown)).success
+        assert (await a.send("chan", shutdown, reply_to=ev.message_id, metadata={"_interim_send": True})).success
+        # same text without any marker (template fallback, turn pending)
+        assert (await a.send("chan", shutdown, reply_to=ev.message_id)).success
         # any other interim status message, whatever its text
-        assert (await a.send("chan", "Working on it...", metadata={"_interim_send": True})).success
+        assert (await a.send("chan", "Working on it...", reply_to=ev.message_id, metadata={"_interim_send": True})).success
     await asyncio.sleep(0.1)
     assert srv.posted == []
     assert sum("dropped gateway" in r.message and r.levelno == logging.INFO for r in caplog.records) == 3
@@ -186,6 +204,7 @@ async def test_shutdown_notice_never_posted_marker_and_text(env, monkeypatch, ca
 @arun
 async def test_broadcaster_never_on_cooldown_viewers_are(env, monkeypatch):
     srv, a = await up(monkeypatch, cooldown=60)
+    a._max_concurrent = 10      # this test is about the cooldown, not the concurrency cap
     assert await a.connect()
     for i in range(3):
         await srv.say("boss", f"!ask q{i}", uid="1", badges="broadcaster/1")
