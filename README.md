@@ -118,7 +118,7 @@ Every row below is a test in this repo (72 pass) or a live run.
 | Ordinary chat that is not addressed to the bot | Ignored, no agent turn | `tests/test_protocol.py` (`test_trigger_filter`, `test_mention_filter`) |
 | One viewer spamming `!ask` | Per-viewer cooldown blocks it, broadcaster is exempt | `test_cooldown_per_user`, `test_broadcaster_never_on_cooldown_viewers_are` |
 | Viewer tries `!backseat`, or types `mod=1` / `broadcaster/1` inside the message text | Ignored, no vote starts | `tests/test_adapter.py::test_backseat_non_mod_ignored_mod_allowed` |
-| Real vote in live chat: `!backseat`, `!vote 2` | "Chat picked: a fun fact about octopuses (1 of 1 votes)", then Hermes answers | Live run (one voter only) |
+| Real vote in live chat with two accounts: `!backseat`, then `!vote 2` from viewer `iszee23` and from `iszee24` | "Chat picked: why cats purr (2 of 2 votes)", then Hermes answers the winning option | Live run, 2026-11-09 (v0.2.0) |
 | Several voters, changed votes, invalid numbers, tie, zero votes, cancel | Correct winner, lowest number wins a tie and says so, zero votes does nothing, cancel dispatches nothing | `test_tally_*`, `test_backseat_cancel_and_no_dispatch`, `test_backseat_zero_votes_and_tie` |
 | Vote winner reaches Hermes with safe settings | Dispatched once, with viewer-level limits | `test_backseat_full_vote_dispatches_winner_safely` |
 | Gateway error text (for example "run hermes doctor") | Replaced by one line, "Sorry, I can't answer right now."; original goes to the log | `test_gateway_error_is_replaced_and_original_logged`, `test_provider_error_inside_turn_is_friendly_line` |
@@ -199,7 +199,7 @@ So by default a viewer can ask the model to repeat these into public chat. The p
 - **Notice matching is English.** Inside a turn, gateway notices are matched by their English text. If your Hermes UI language is not English, those in-turn notices are not recognised by text. The rule that nothing is posted outside a pending turn still holds in every language.
 - **Real network drop is not proven live.** Reconnect is proven against a local fake IRC server, including a silent server (client PING after 240 s, reconnect after 360 s). On a real drop the Hermes base-class watcher retries with a 30 to 300 second backoff.
 - **A running vote is lost** if the connection drops or the gateway restarts.
-- **Backseat tested live with one voter.** Multi-voter, tie, cancel and mod paths are covered by tests only.
+- **Backseat tested live with two voters.** Larger votes, ties, cancel and the mod path are covered by tests only.
 - **No native polls or channel points.** Votes are chat commands, because my channel is not Affiliate. No moderation actions (timeouts, bans) are implemented.
 - **One channel per gateway.**
 
