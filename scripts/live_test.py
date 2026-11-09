@@ -3,6 +3,10 @@
   python live_test.py say "<text>" [--wait N]   # post as the bot account over a SECOND connection (same token)
                                                 # and capture what an anonymous justinfan reader sees
   python live_test.py read --wait N             # only capture with an anonymous reader
+  python live_test.py seq --wait N --step "0:!backseat q | a | b" --step "8:!vote 2"
+                                                # send a timed sequence of messages (second connection, delay
+                                                # in seconds from start) while an anonymous reader records
+                                                # every chat line with a timestamp
 """
 import argparse
 import asyncio
@@ -43,7 +47,7 @@ async def reader_task(seconds, out):
     w.close()
 
 
-async def say(text):
+async def open_sender():
     token = open(TOKEN_FILE).read().strip()
     token = token[6:] if token.lower().startswith("oauth:") else token
     r, w = await _conn()
@@ -60,28 +64,48 @@ async def say(text):
         if "authentication failed" in line.lower():
             raise SystemExit("AUTH FAILED")
     await asyncio.sleep(1.0)
+    return w
+
+
+async def say(text):
+    w = await open_sender()
     await _send(w, f"PRIVMSG #{CHANNEL} :{text}")
     print(time.strftime("%H:%M:%S"), "SENT as second connection:", text)
     await asyncio.sleep(1.0)
     w.close()
 
 
+async def seq(steps):
+    w = await open_sender()
+    t0 = time.time()
+    for delay, text in steps:
+        await asyncio.sleep(max(0.0, t0 + delay - time.time()))
+        await _send(w, f"PRIVMSG #{CHANNEL} :{text}")
+        print(time.strftime("%H:%M:%S"), "SENT as second connection:", text)
+    await asyncio.sleep(1.0)
+    w.close()
+
+
 async def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["say", "read"])
+    ap.add_argument("mode", choices=["say", "read", "seq"])
     ap.add_argument("text", nargs="?", default="")
     ap.add_argument("--wait", type=int, default=25)
+    ap.add_argument("--step", action="append", default=[], help="DELAY:TEXT (seq mode)")
     a = ap.parse_args()
     seen = []
     rt = asyncio.create_task(reader_task(a.wait, seen))
     await asyncio.sleep(3)  # reader joined
     if a.mode == "say":
         await say(a.text)
+    elif a.mode == "seq":
+        await seq([(float(x.split(":", 1)[0]), x.split(":", 1)[1]) for x in a.step])
     await rt
     print("--- anonymous reader captured %d PRIVMSG line(s) ---" % len(seen))
     for ts, line in seen:
         m = re.search(r"display-name=([^;]*);.*? PRIVMSG #\S+ :(.*)$", line)
-        print(ts, "RAW:", line.encode("ascii", "backslashreplace").decode())
+        who, msg = (m.group(1), m.group(2)) if m else ("?", line)
+        print(ts, f"[{who}]", msg.encode("ascii", "backslashreplace").decode())
 
 
 asyncio.run(main())

@@ -2,9 +2,11 @@ name: twitch-assist
 label: Twitch
 kind: platform
 version: 0.1.0
+requires_hermes: ">=0.23.0"
 description: >
   Twitch chat platform adapter for Hermes Agent. Joins a streamer's Twitch chat as a co-host and
-  answers viewers who address it with !ask or an @mention. Stdlib only (asyncio IRC over TLS).
+  answers viewers who address it with !ask or an @mention, and runs Backseat Mode chat votes
+  (!backseat by the broadcaster or a mod, !vote N by chat). Stdlib only (asyncio IRC over TLS).
   Twitch-originated turns are limited to web search; viewers cannot run gateway commands.
 author: Techkeyy
 requires_env:
@@ -28,6 +30,10 @@ optional_env:
   - name: TWITCH_COOLDOWN_SECONDS
     description: "Per-viewer cooldown between questions in seconds (default: 20)"
     prompt: "Cooldown seconds"
+    password: false
+  - name: TWITCH_VOTE_SECONDS
+    description: "Length of a Backseat Mode chat vote in seconds (default: 45)"
+    prompt: "Vote seconds"
     password: false
   - name: TWITCH_ALLOW_ALL_USERS
     description: "Let any viewer talk to the bot (default: true; tools are limited to web search)"

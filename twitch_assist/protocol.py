@@ -88,10 +88,20 @@ class ChatMessage:
     message_id: str
     text: str
     badges: list = field(default_factory=list)
+    mod_tag: bool = False
 
     @property
     def is_broadcaster(self) -> bool:
         return any(b.startswith("broadcaster/") for b in self.badges)
+
+    @property
+    def is_moderator(self) -> bool:
+        return self.mod_tag or any(b.startswith("moderator/") for b in self.badges)
+
+    @property
+    def can_manage(self) -> bool:
+        """Broadcaster or moderator, from the server-supplied IRCv3 tags only (never from message text)."""
+        return self.is_broadcaster or self.is_moderator
 
 
 def parse_privmsg(msg: dict) -> Optional[ChatMessage]:
@@ -108,7 +118,7 @@ def parse_privmsg(msg: dict) -> Optional[ChatMessage]:
         channel=channel.lstrip("#").lower(), login=login,
         display_name=tags.get("display-name") or login,
         user_id=tags.get("user-id", "") or login, message_id=tags.get("id", ""),
-        text=text, badges=badges)
+        text=text, badges=badges, mod_tag=tags.get("mod", "") == "1")
 
 
 # -- addressing --------------------------------------------------------------
@@ -140,7 +150,10 @@ class Cooldown:
         self._last: "OrderedDict[str, float]" = OrderedDict()
         self._max = max_users
 
-    def allow(self, user_id: str, now: Optional[float] = None) -> bool:
+    def allow(self, user_id: str, now: Optional[float] = None, *, exempt: bool = False) -> bool:
+        """``exempt`` (the broadcaster) is never limited and does not start a cooldown."""
+        if exempt:
+            return True
         now = time.monotonic() if now is None else now
         last = self._last.get(user_id)
         if last is not None and now - last < self.seconds:
@@ -230,3 +243,146 @@ def split_message(content: str, reply_user: Optional[str] = None, *,
     if prefix:
         parts[0] = prefix + parts[0]
     return parts
+
+
+# -- Backseat Mode (chat votes) ----------------------------------------------
+
+VOTE_COMMAND = "!vote"
+BACKSEAT_COMMAND = "!backseat"
+MIN_OPTIONS = 2
+MAX_OPTIONS = 4
+MAX_PROMPT_CHARS = 120
+MAX_OPTION_CHARS = 60
+BACKSEAT_USAGE = "Usage: !backseat <prompt> | <option 1> | <option 2> [| up to 4 options]"
+VOTE_RUNNING_TEXT = "A vote is already running."
+VOTE_CANCELLED_TEXT = "Vote cancelled."
+NO_VOTES_TEXT = "No votes, nothing to do."
+
+
+def _clean(text: str) -> str:
+    return " ".join("".join(ch for ch in text if ch.isprintable() or ch.isspace()).split())
+
+
+@dataclass
+class BackseatCommand:
+    kind: str                       # "start" | "cancel" | "invalid"
+    prompt: str = ""
+    options: list = field(default_factory=list)
+    error: str = ""
+
+
+def parse_backseat(text: str) -> Optional[BackseatCommand]:
+    """Parse ``!backseat <prompt> | <opt> | <opt> ...``. None when ``text`` is not a !backseat command.
+
+    This only parses syntax; whether the sender may start a vote is decided separately from IRC tags.
+    """
+    m = re.match(rf"{re.escape(BACKSEAT_COMMAND)}(?:\s+|$)", text.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    body = text.strip()[m.end():].strip()
+    if body.lower() == "cancel":
+        return BackseatCommand("cancel")
+    pieces = [_clean(x) for x in body.split("|")]
+    prompt, options = pieces[0], [x for x in pieces[1:] if x]
+    if not prompt or len(options) < MIN_OPTIONS:
+        return BackseatCommand("invalid", error=BACKSEAT_USAGE)
+    if len(options) > MAX_OPTIONS:
+        return BackseatCommand("invalid", error=f"At most {MAX_OPTIONS} options. {BACKSEAT_USAGE}")
+    if len(prompt) > MAX_PROMPT_CHARS or any(len(o) > MAX_OPTION_CHARS for o in options):
+        return BackseatCommand(
+            "invalid", error=f"Keep the prompt under {MAX_PROMPT_CHARS} and each option under {MAX_OPTION_CHARS} characters.")
+    return BackseatCommand("start", prompt=prompt, options=options)
+
+
+def is_vote_command(text: str) -> bool:
+    """True for any message starting with ``!vote`` as a whole word (such messages never reach the agent)."""
+    return re.match(rf"{re.escape(VOTE_COMMAND)}(?:\s|$)", text.strip(), re.IGNORECASE) is not None
+
+
+def parse_vote(text: str) -> Optional[int]:
+    """The N of ``!vote N`` (1-based), or None when the message has no valid single number."""
+    m = re.match(rf"{re.escape(VOTE_COMMAND)}\s+(\d{{1,3}})\s*$", text.strip(), re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+@dataclass
+class VoteResult:
+    winner: Optional[int]           # 1-based option number; None when there were no votes
+    option: str
+    votes: int                      # votes the winner got
+    total: int
+    tie: bool
+
+
+class BackseatVote:
+    """One running vote: a vote per user id (a later vote replaces an earlier one)."""
+
+    def __init__(self, prompt: str, options: list, starter_id: str, starter_name: str, seconds: float):
+        self.prompt = prompt
+        self.options = list(options)
+        self.starter_id = starter_id
+        self.starter_name = starter_name
+        self.seconds = seconds
+        self._votes: dict = {}
+
+    def cast(self, user_id: str, number: Optional[int]) -> bool:
+        """Record a vote; False (and nothing recorded) for a missing or out-of-range number."""
+        if number is None or not 1 <= number <= len(self.options):
+            return False
+        self._votes[user_id] = number
+        return True
+
+    def result(self) -> VoteResult:
+        total = len(self._votes)
+        if total == 0:
+            return VoteResult(None, "", 0, 0, False)
+        counts = {i: 0 for i in range(1, len(self.options) + 1)}
+        for n in self._votes.values():
+            counts[n] += 1
+        top = max(counts.values())
+        leaders = [i for i, c in counts.items() if c == top]
+        winner = min(leaders)
+        return VoteResult(winner, self.options[winner - 1], top, total, len(leaders) > 1)
+
+
+def format_announcement(vote: BackseatVote) -> str:
+    opts = " ".join(f"{i}) {o}" for i, o in enumerate(vote.options, 1))
+    nums = ", ".join(f"{VOTE_COMMAND} {i}" for i in range(1, len(vote.options) + 1))
+    return f"Backseat vote: {vote.prompt} {opts} Type {nums} ({int(vote.seconds)}s)"
+
+
+def format_result(res: VoteResult) -> str:
+    if res.winner is None:
+        return NO_VOTES_TEXT
+    tie = "tie, " if res.tie else ""
+    return f"Chat picked: {res.option} ({tie}{res.votes} of {res.total} votes)"
+
+
+def build_backseat_task(prompt: str, option: str) -> str:
+    return (f'Chat voted in Backseat Mode. Prompt: "{prompt}". Winning choice: "{option}". '
+            "Do this now and reply to chat in under 450 characters.")
+
+
+# -- gateway notices that must not reach public chat ---------------------------
+
+FRIENDLY_ERROR_TEXT = "Sorry, I can't answer right now."
+# Hermes gateway notices all come from locale strings that start with a status emoji (the strings carry
+# no metadata flag). Errors become the friendly line; pure status/progress pings are dropped.
+_NOTICE_ERROR_MARKERS = ("⚠", "⛔", "⏱", "📬")                  # warning, no entry, stopwatch, mailbox
+_NOTICE_SILENT_MARKERS = ("⏳", "⏩", "↪", "⚡", "♻", "▶", "⏸",
+                          "🟡", "❓", "↩", "💬")             # hourglass, steer, redirect, bolt, recycle, play/pause...
+_NOTICE_LIFECYCLE_PHRASES = ("hermes is shutting down", "hermes is restarting", "gateway online")
+_NOTICE_ERROR_PHRASES = ("sorry, i encountered an error",)
+
+
+def classify_gateway_notice(text: str) -> Optional[str]:
+    """"error" | "silent" | None (a normal answer) for text about to be posted to chat."""
+    t = (text or "").lstrip()
+    low = t.lower()
+    if any(x in low for x in _NOTICE_LIFECYCLE_PHRASES):
+        return "silent"
+    if t.startswith(_NOTICE_ERROR_MARKERS) or any(low.startswith(p) for p in _NOTICE_ERROR_PHRASES):
+        return "error"
+    if t.startswith(_NOTICE_SILENT_MARKERS):
+        return "silent"
+    return None

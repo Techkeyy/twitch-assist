@@ -6,7 +6,7 @@ into chat. Modelled on the bundled IRC platform plugin.
 
 Environment (scoped secrets, set through Hermes): TWITCH_TOKEN (secret), TWITCH_CHANNEL,
 optional TWITCH_BOT_USERNAME, TWITCH_TRIGGER (default "!ask"), TWITCH_COOLDOWN_SECONDS (default 20),
-TWITCH_ALLOWED_USERS, TWITCH_ALLOW_ALL_USERS (default true).
+TWITCH_VOTE_SECONDS (Backseat vote length, default 45), TWITCH_ALLOWED_USERS, TWITCH_ALLOW_ALL_USERS (default true).
 
 Security: Twitch viewers are anonymous strangers. Turns that originate from Twitch get only the
 ``search`` toolset (see ``TwitchAdapter.toolsets_for_source``) and cannot run gateway slash commands.
@@ -31,14 +31,17 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.helpers import cancel_task
 
 from .protocol import (
-    MIN_SEND_INTERVAL, Cooldown, SentTracker, extract_question, is_auth_failure,
-    parse_line, parse_privmsg, split_message,
+    FRIENDLY_ERROR_TEXT, MIN_SEND_INTERVAL, VOTE_CANCELLED_TEXT, VOTE_RUNNING_TEXT, BackseatVote, Cooldown,
+    SentTracker, build_backseat_task, classify_gateway_notice, extract_question, format_announcement,
+    format_result, is_auth_failure, is_vote_command, parse_backseat, parse_line, parse_privmsg, parse_vote,
+    split_message,
 )
 
 logger = logging.getLogger(__name__)
 
 IRC_HOST = "irc.chat.twitch.tv"
 IRC_PORT = 6697
+IRC_TLS = True  # tests point IRC_HOST/IRC_PORT at a local plain-TCP fake server and set this False
 VALIDATE_URL = "https://id.twitch.tv/oauth2/validate"
 SAFE_TOOLSETS = ["search", "no_mcp"]  # web_search only; "no_mcp" also blocks every configured MCP server
 _TRUTHY = {"1", "true", "yes", "on"}
@@ -83,6 +86,14 @@ class TwitchAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             cooldown = 20.0
         self._cooldown = Cooldown(cooldown)
+        try:
+            vote_seconds = float(_get_scoped_secret("TWITCH_VOTE_SECONDS", "") or extra.get("vote_seconds", 45))
+        except (TypeError, ValueError):
+            vote_seconds = 45.0
+        self._vote_seconds = min(max(vote_seconds, 5.0), 600.0)
+        self._vote: Optional[BackseatVote] = None
+        self._vote_task: Optional[asyncio.Task] = None
+        self._closing = False
         self._sent = SentTracker()
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
@@ -111,7 +122,7 @@ class TwitchAdapter(BasePlatformAdapter):
             return self._fail("config_missing", "TWITCH_TOKEN and TWITCH_CHANNEL must be set", retryable=False)
         status, login = await asyncio.to_thread(_validate_token_sync, token)
         if status == "invalid":
-            logger.error("Twitch: token rejected by Twitch token validation (expired or revoked); not connecting")
+            logger.error("Twitch login failed: check TWITCH_TOKEN (rejected by Twitch token validation: expired or revoked)")
             return self._fail("auth_failed", "Twitch rejected TWITCH_TOKEN", retryable=False)
         if not self.bot_login:
             self.bot_login = login or self.channel
@@ -120,9 +131,11 @@ class TwitchAdapter(BasePlatformAdapter):
         self._welcome.clear()
         self._joined.clear()
         self._auth_failed = False
+        self._closing = False
         try:
             self._reader, self._writer = await asyncio.wait_for(
-                asyncio.open_connection(IRC_HOST, IRC_PORT, ssl=ssl.create_default_context()), timeout=30.0)
+                asyncio.open_connection(IRC_HOST, IRC_PORT, ssl=ssl.create_default_context() if IRC_TLS else None),
+                timeout=30.0)
         except Exception as e:
             logger.error("Twitch: failed to connect to %s:%s: %s", IRC_HOST, IRC_PORT, e)
             return self._fail("connect_failed", str(e), retryable=True)
@@ -137,7 +150,7 @@ class TwitchAdapter(BasePlatformAdapter):
             await self.disconnect()
             return self._fail("registration_timeout", "Twitch did not welcome the connection", retryable=True)
         if self._auth_failed:
-            logger.error("Twitch: login authentication failed (check TWITCH_TOKEN and TWITCH_BOT_USERNAME); not connecting")
+            logger.error("Twitch login failed: check TWITCH_TOKEN (and TWITCH_BOT_USERNAME)")
             await self.disconnect()
             return self._fail("auth_failed", "Twitch login authentication failed", retryable=False)
         await self._send_raw(f"JOIN #{self.channel}")
@@ -152,8 +165,11 @@ class TwitchAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        self._closing = True  # close-time socket/SSL errors from here on are expected, not errors
         with contextlib.suppress(Exception):
             self._release_platform_lock()
+        await cancel_task(self._vote_task)
+        self._vote_task, self._vote = None, None
         was_connected = self.is_connected
         self._mark_disconnected()
         if self._writer and not self._writer.is_closing():
@@ -173,6 +189,20 @@ class TwitchAdapter(BasePlatformAdapter):
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        if metadata and metadata.get("_interim_send"):
+            # Structural marker Hermes puts on every mid-turn / lifecycle status send (shutdown, restart,
+            # approval prompts, advisories): gateway-internal, never for public chat.
+            logger.info("Twitch: dropped gateway status message (interim marker): %s", " ".join(content.split())[:200])
+            return SendResult(success=True)
+        notice = classify_gateway_notice(content)
+        if notice == "silent":
+            logger.info("Twitch: dropped gateway lifecycle notice: %s", " ".join(content.split())[:200])
+            return SendResult(success=True)
+        if notice:
+            # Model/provider failures and other gateway errors (host details, /commands hints) become one friendly line.
+            logger.warning("Twitch: withheld gateway error from chat: %s", " ".join(content.split())[:300])
+            content = FRIENDLY_ERROR_TEXT
+            reply_to = None
         if not self._writer or self._writer.is_closing():
             return SendResult(success=False, error="Not connected", retryable=True)
         target = _clean_channel(chat_id) or self.channel
@@ -234,11 +264,14 @@ class TwitchAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error("Twitch: receive loop error: %s", e)
+            if self._closing:
+                logger.debug("Twitch: connection closed during shutdown (%s)", e)  # expected, e.g. SSL close-notify
+            else:
+                logger.error("Twitch: receive loop error: %s", e)
         finally:
             self._welcome.set()  # unblock connect() if the socket died during login
-            if self.is_connected:
-                logger.warning("Twitch: connection lost, marking disconnected")
+            if self.is_connected and not self._closing:
+                logger.warning("Twitch: connection lost, marking disconnected (gateway will reconnect with backoff)")
                 self._set_fatal_error("connection_lost", "Twitch connection closed unexpectedly", retryable=True)
                 await self._notify_fatal_error()
 
@@ -268,10 +301,17 @@ class TwitchAdapter(BasePlatformAdapter):
             return
         if chat.login == self.bot_login and self._sent.is_own(chat.text):
             return  # something this adapter posted itself
+        if is_vote_command(chat.text):
+            self._handle_vote(chat)  # !vote never starts an agent turn
+            return
+        cmd = parse_backseat(chat.text)
+        if cmd is not None:
+            await self._handle_backseat(chat, cmd)
+            return
         question = extract_question(chat.text, self.trigger, self.bot_login)
         if question is None:
             return  # not addressed to the bot
-        if not self._cooldown.allow(chat.user_id):
+        if not self._cooldown.allow(chat.user_id, exempt=chat.is_broadcaster):
             logger.debug("Twitch: %s is on cooldown, ignoring", chat.login)
             return
         if not self._message_handler:
@@ -282,14 +322,58 @@ class TwitchAdapter(BasePlatformAdapter):
             self._senders[chat.message_id] = (chat.display_name, chat.is_broadcaster)
             while len(self._senders) > 200:
                 self._senders.popitem(last=False)
-        source = self.build_source(
-            chat_id=chat.channel, chat_name=chat.channel, chat_type="group",
-            user_id=chat.user_id, user_name=chat.display_name, message_id=chat.message_id or None)
         logger.info("Twitch: dispatching message from %s (%d chars)", chat.display_name, len(question))
+        await self._dispatch(chat.channel, chat.user_id, chat.display_name, chat.message_id or None, question)
+
+    async def _dispatch(self, channel: str, user_id: str, display_name: str, message_id: Optional[str], text: str) -> None:
+        """The single path into Hermes for !ask, @mentions and Backseat winners."""
+        source = self.build_source(
+            chat_id=channel, chat_name=channel, chat_type="group",
+            user_id=user_id, user_name=display_name, message_id=message_id)
         await self.handle_message(MessageEvent(
-            text=question, message_type=MessageType.TEXT, source=source,
-            message_id=chat.message_id or None, timestamp=datetime.datetime.now(),
-            reply_expected=True, allow_gateway_control=False))  # viewers cannot run /commands
+            text=text, message_type=MessageType.TEXT, source=source,
+            message_id=message_id, timestamp=datetime.datetime.now(),
+            reply_expected=True, allow_gateway_control=False))  # viewers cannot run /commands; tools: toolsets_for_source
+
+    # -- Backseat Mode ------------------------------------------------------
+
+    def _handle_vote(self, chat) -> None:
+        if self._vote is not None and self._vote.cast(chat.user_id, parse_vote(chat.text)):
+            logger.debug("Twitch: vote recorded from %s", chat.login)
+
+    async def _handle_backseat(self, chat, cmd) -> None:
+        if not chat.can_manage:
+            return  # only the broadcaster / a moderator (server-supplied tags) may run votes; silent for others
+        if cmd.kind == "cancel":
+            if self._vote is not None:
+                await cancel_task(self._vote_task)
+                self._vote, self._vote_task = None, None
+                await self.send(chat.channel, VOTE_CANCELLED_TEXT)
+            return
+        if cmd.kind == "invalid":
+            await self.send(chat.channel, cmd.error)
+            return
+        if self._vote is not None:
+            await self.send(chat.channel, VOTE_RUNNING_TEXT)
+            return
+        vote = BackseatVote(cmd.prompt, cmd.options, chat.user_id, chat.display_name, self._vote_seconds)
+        self._vote = vote
+        logger.info("Twitch: Backseat vote started by %s (%d options, %ds)", chat.display_name, len(vote.options), vote.seconds)
+        self._vote_task = asyncio.create_task(self._run_vote(vote, chat.channel))
+        await self.send(chat.channel, format_announcement(vote))
+
+    async def _run_vote(self, vote: BackseatVote, channel: str) -> None:
+        await asyncio.sleep(vote.seconds)
+        res = vote.result()
+        self._vote, self._vote_task = None, None  # a new vote may start while the winner runs
+        await self.send(channel, format_result(res))
+        if res.winner is None:
+            return
+        logger.info("Twitch: Backseat winner %d (%d of %d votes); dispatching to Hermes", res.winner, res.votes, res.total)
+        message_id = f"backseat-{int(time.time() * 1000)}"
+        self._senders[message_id] = ("", True)  # answer goes to chat, not @-addressed to the starter
+        await self._dispatch(channel, vote.starter_id, vote.starter_name, message_id,
+                             build_backseat_task(vote.prompt, res.option))
 
 
 # -- Plugin registration ------------------------------------------------------
@@ -320,6 +404,7 @@ def _env_enablement() -> Optional[dict]:
     seed = _seed_extra_from_env((
         ("TWITCH_BOT_USERNAME", "bot_username", None), ("TWITCH_TRIGGER", "trigger", None),
         ("TWITCH_COOLDOWN_SECONDS", "cooldown_seconds", float),
+        ("TWITCH_VOTE_SECONDS", "vote_seconds", float),
     ), home_env="TWITCH_HOME_CHANNEL", home_default=channel)  # home = the channel, so the gateway never posts its "set a home channel" nag into public chat
     allow_all = str(_get_scoped_secret("TWITCH_ALLOW_ALL_USERS", "") or "").strip().lower()
     extra = {"channel": channel, **seed}
