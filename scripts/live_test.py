@@ -10,13 +10,15 @@
 """
 import argparse
 import asyncio
+import os
 import random
 import re
 import ssl
 import time
 
-TOKEN_FILE = r"C:\Users\HomePC\Desktop\Twitch Access.txt"
-CHANNEL = "iszee24"
+# Set both env vars before running: a text file holding your chat token, and the channel to test in.
+TOKEN_FILE = os.environ["TWITCH_TOKEN_FILE"]
+CHANNEL = os.environ["TWITCH_CHANNEL"]
 
 
 async def _conn():

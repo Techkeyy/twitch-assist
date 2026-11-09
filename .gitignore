@@ -7,3 +7,5 @@ venv/
 *.log
 Twitch Access.txt
 spike/
+director.md
+catalog/
