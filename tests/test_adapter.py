@@ -111,6 +111,8 @@ def env(monkeypatch):
     monkeypatch.setattr(ad, "_validate_token_sync", lambda token: ("ok", "bot"))
     monkeypatch.setattr(ad, "MIN_SEND_INTERVAL", 0.0)
     monkeypatch.setattr(ad, "_warn_unsafe_config", lambda: None)  # never read the real Hermes config in tests
+    monkeypatch.setenv("TWITCH_ALLOW_ALL_USERS", "true")           # most tests exercise the explicit open mode ...
+    monkeypatch.setattr(ad, "_open_mode_check", lambda: (True, ""))  # ... on a safe config (see test_private_mode.py)
 
 
 def make_adapter(monkeypatch, port, cooldown=20, vote_seconds=1.0):

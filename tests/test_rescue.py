@@ -175,9 +175,8 @@ def test_env_seed_private_notices_and_no_home_channel(monkeypatch):
     monkeypatch.setenv("TWITCH_MAX_CONCURRENT", "5")
     seed = ad._env_enablement()
     assert seed["notice_delivery"] == "private" and "home_channel" not in seed
-    assert seed["max_concurrent"] == 5 and seed["channel"] == "chan" and seed["allowed_users"] == ["*"]
-    monkeypatch.setenv("TWITCH_ALLOW_ALL_USERS", "false")
-    assert "allowed_users" not in ad._env_enablement()
+    assert seed["max_concurrent"] == 5 and seed["channel"] == "chan"
+    assert "allowed_users" not in seed                 # private by default: no "*" seeded
 
 
 def test_provider_error_inside_turn_is_friendly_line():

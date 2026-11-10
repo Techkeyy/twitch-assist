@@ -1,10 +1,10 @@
 name: twitch-assist
 label: Twitch
 kind: platform
-version: 0.2.0
+version: 0.3.0
 requires_hermes: ">=0.23.0"
 description: >
-  Twitch chat platform adapter for Hermes Agent. Joins a streamer's Twitch chat as a co-host and
+  Twitch chat platform adapter for Hermes Agent. Private by default (broadcaster and TWITCH_ALLOWED_USERS only). Joins a streamer's Twitch chat as a co-host and
   answers viewers who address it with !ask or an @mention, and runs Backseat Mode chat votes
   (!backseat by the broadcaster or a mod, !vote N by chat). Stdlib only (asyncio IRC over TLS).
   Twitch-originated turns are limited to web search (toolset override plus a pre_tool_call guard); viewers cannot
@@ -43,10 +43,10 @@ optional_env:
     prompt: "Max concurrent viewer turns"
     password: false
   - name: TWITCH_ALLOW_ALL_USERS
-    description: "Let any viewer talk to the bot, vote and start votes (default: true; tools are limited to web search). false limits !ask, !vote and !backseat to TWITCH_ALLOWED_USERS and the broadcaster"
-    prompt: "Allow all viewers? (true/false)"
+    description: "Explicit opt-in to let any viewer talk to the bot, vote and start votes (default: unset = private, only the broadcaster and TWITCH_ALLOWED_USERS). Even when true, non-broadcaster requests are dropped unless memory.memory_enabled and memory.user_profile_enabled are false and platform_toolsets.twitch is pinned to [search, no_mcp]"
+    prompt: "Open the bot to ALL viewers? (true to opt in, leave empty for private)"
     password: false
   - name: TWITCH_ALLOWED_USERS
-    description: "Comma-separated Twitch user IDs allowed to talk to the bot (used when TWITCH_ALLOW_ALL_USERS=false)"
+    description: "Comma-separated numeric Twitch user IDs allowed to talk to the bot, vote and start votes, besides the broadcaster (default: none)"
     prompt: "Allowed user IDs"
     password: false

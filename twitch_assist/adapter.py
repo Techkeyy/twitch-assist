@@ -7,7 +7,9 @@ into chat. Modelled on the bundled IRC platform plugin.
 Environment (scoped secrets, set through Hermes): TWITCH_TOKEN (secret), TWITCH_CHANNEL,
 optional TWITCH_BOT_USERNAME, TWITCH_TRIGGER (default "!ask"), TWITCH_COOLDOWN_SECONDS (default 20),
 TWITCH_VOTE_SECONDS (Backseat vote length, default 45), TWITCH_MAX_CONCURRENT (viewer turns in flight, default 3),
-TWITCH_ALLOWED_USERS, TWITCH_ALLOW_ALL_USERS (default true).
+TWITCH_ALLOWED_USERS, TWITCH_ALLOW_ALL_USERS (default unset = private: only the broadcaster and
+TWITCH_ALLOWED_USERS ids may use the bot; "true" opens it to every viewer, and then non-broadcaster turns run only
+while memory is off and platform_toolsets.twitch is pinned, see ``_open_mode_check``).
 
 Security: Twitch viewers are anonymous strangers. Turns that originate from Twitch get only the
 ``search`` toolset (see ``TwitchAdapter.toolsets_for_source``), a ``pre_tool_call`` guard blocks every tool except
@@ -55,7 +57,6 @@ TURN_TIMEOUT = 180.0     # a dispatched turn frees its slot, and its answer goes
 REPLY_GRACE = 15.0       # after the first answer, more parts of the same reply are still accepted this long
 DEFAULT_MAX_CONCURRENT = 3
 _TRUTHY = {"1", "true", "yes", "on"}
-_FALSY = {"0", "false", "no", "off"}
 
 
 def _clean_token(raw: str) -> str:
@@ -93,6 +94,12 @@ def _parse_ids(raw: str) -> set:
     return {x.strip() for x in (raw or "").split(",") if x.strip()}
 
 
+def _is_open(allow_all_raw: str, ids: set) -> bool:
+    """Open to every viewer only when the owner says so explicitly (TWITCH_ALLOW_ALL_USERS truthy, or ``*`` in
+    TWITCH_ALLOWED_USERS). Unset, empty, false or junk means private."""
+    return str(allow_all_raw or "").strip().lower() in _TRUTHY or "*" in ids
+
+
 class TwitchAdapter(BasePlatformAdapter):
     """Async Twitch IRC adapter implementing the BasePlatformAdapter interface."""
 
@@ -119,9 +126,11 @@ class TwitchAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             max_concurrent = DEFAULT_MAX_CONCURRENT
         self._max_concurrent = max(1, max_concurrent)
-        allow_all = str(_get_scoped_secret("TWITCH_ALLOW_ALL_USERS", "") or "").strip().lower()
-        self._restricted = allow_all in _FALSY
         self._allowed_ids = _parse_ids(_get_scoped_secret("TWITCH_ALLOWED_USERS", ""))
+        self._open = _is_open(_get_scoped_secret("TWITCH_ALLOW_ALL_USERS", ""), self._allowed_ids)
+        self._open_check: Optional[tuple] = None   # cached (ok, reason) of _open_mode_check
+        self._refusal_logged = False
+        self._gateway_ids: set = set()             # broadcaster ids the gateway's own authorization must also accept
         self._turns: "OrderedDict[str, _Turn]" = OrderedDict()  # dispatched turns, by message id
         self._turn_seq = 0
         self._vote: Optional[BackseatVote] = None
@@ -192,6 +201,10 @@ class TwitchAdapter(BasePlatformAdapter):
             logger.warning("Twitch: no JOIN confirmation for #%s within 10s; continuing", self.channel)
         self._mark_connected()
         _warn_unsafe_config()
+        if self._open:
+            ok, reason = self._open_ok()
+            if not ok:
+                self._log_refusal(reason)
         logger.info("Twitch: connected to %s:%s as %s, joined #%s (trigger %r)",
                     IRC_HOST, IRC_PORT, self.bot_login, self.channel, self.trigger)
         self._wire_plugin_handlers(None)
@@ -379,17 +392,59 @@ class TwitchAdapter(BasePlatformAdapter):
                 await self._handle_chat(chat)
 
     def _may_use(self, chat) -> bool:
-        """Allowlist for !vote / !backseat, same rule as !ask: open to all unless TWITCH_ALLOW_ALL_USERS=false;
-        then only TWITCH_ALLOWED_USERS ids (or ``*``) and the broadcaster."""
-        if not self._restricted or chat.is_broadcaster:
+        """Allowlist for !ask, @mentions, !vote and !backseat. Private by default: only the broadcaster (server
+        badge) and TWITCH_ALLOWED_USERS ids. Everyone, only when the owner opened the bot explicitly."""
+        if chat.is_broadcaster or self._open:
             return True
-        return chat.user_id in self._allowed_ids or "*" in self._allowed_ids
+        return chat.user_id in self._allowed_ids
+
+    def _open_ok(self) -> tuple:
+        if self._open_check is None:
+            self._open_check = _open_mode_check()
+        return self._open_check
+
+    def _log_refusal(self, reason: str) -> None:
+        if not self._refusal_logged:
+            self._refusal_logged = True
+            logger.warning("Twitch: open to all viewers (TWITCH_ALLOW_ALL_USERS) but not safe, so requests from anyone "
+                           "except the broadcaster are dropped: %s. Fix the config or use a dedicated Hermes profile "
+                           "(see the README); this is logged once", reason)
+
+    def _open_gate(self, is_broadcaster: bool) -> bool:
+        """Fail closed: in open mode a non-broadcaster turn is dispatched only while the config is safe."""
+        if is_broadcaster or not self._open:
+            return True
+        ok, reason = self._open_ok()
+        if ok:
+            return True
+        self._log_refusal(reason)
+        return False
+
+    def _grant_gateway(self, user_id: str) -> None:
+        """The gateway authorizes senders itself (TWITCH_ALLOWED_USERS env, else config.extra.allowed_users).
+        The broadcaster is identified by the server's badge, so tell the gateway to accept that id too."""
+        if not user_id or user_id in self._gateway_ids:
+            return
+        self._gateway_ids.add(user_id)
+        extra = getattr(self.config, "extra", None)
+        if isinstance(extra, dict):
+            cur = extra.get("allowed_users") or []
+            cur = [x.strip() for x in cur.split(",") if x.strip()] if isinstance(cur, str) else list(cur)
+            if "*" not in cur and user_id not in cur:
+                cur.append(user_id)
+            extra["allowed_users"] = cur
+
+    def resolved_allowlist_user_ids(self) -> set:
+        """Gateway hook: extra ids its allowlist check accepts (the broadcaster, learned from the badge)."""
+        return set(self._gateway_ids)
 
     async def _handle_chat(self, chat) -> None:
         if chat.channel != self.channel:
             return
         if chat.login == self.bot_login and self._sent.is_own(chat.text):
             return  # something this adapter posted itself
+        if chat.is_broadcaster:
+            self._grant_gateway(chat.user_id)
         if is_vote_command(chat.text):
             if self._may_use(chat):
                 self._handle_vote(chat)  # !vote never starts an agent turn
@@ -402,6 +457,13 @@ class TwitchAdapter(BasePlatformAdapter):
         question = extract_question(chat.text, self.trigger, self.bot_login)
         if question is None:
             return  # not addressed to the bot
+        # Authorization comes first: a refused viewer never registers a turn, takes a slot or starts a cooldown.
+        if not self._may_use(chat):
+            logger.debug("Twitch: %s is not allowed to use the bot, ignoring", chat.login)
+            return
+        if not self._open_gate(chat.is_broadcaster):
+            logger.debug("Twitch: dropped request from %s (open mode is not safe)", chat.login)
+            return
         if not chat.is_broadcaster and self._active_turns() >= self._max_concurrent:
             logger.info("Twitch: %d viewer turns already in flight (TWITCH_MAX_CONCURRENT), dropping request from %s",
                         self._max_concurrent, chat.login)
@@ -453,6 +515,8 @@ class TwitchAdapter(BasePlatformAdapter):
     async def _handle_backseat(self, chat, cmd) -> None:
         if not chat.can_manage:
             return  # only the broadcaster / a moderator (server-supplied tags) may run votes; silent for others
+        if not self._open_gate(chat.is_broadcaster):
+            return  # open mode on an unsafe config: only the broadcaster may start a vote that becomes an agent turn
         if cmd.kind == "cancel":
             if self._vote is not None:
                 await cancel_task(self._vote_task)  # also stops a result/winner dispatch that has not happened yet
@@ -466,6 +530,7 @@ class TwitchAdapter(BasePlatformAdapter):
             await self._post(chat.channel, VOTE_RUNNING_TEXT)
             return
         vote = BackseatVote(cmd.prompt, cmd.options, chat.user_id, chat.display_name, self._vote_seconds)
+        vote.starter_is_broadcaster = chat.is_broadcaster
         self._vote = vote
         logger.info("Twitch: Backseat vote started by %s (%d options, %ds)", chat.display_name, len(vote.options), vote.seconds)
         self._vote_task = asyncio.create_task(self._run_vote(vote, chat.channel))
@@ -483,6 +548,8 @@ class TwitchAdapter(BasePlatformAdapter):
                 self._vote = None
             if res.winner is None or self._closing:
                 return
+            if not self._open_gate(bool(getattr(vote, "starter_is_broadcaster", False))):
+                return  # started by a non-broadcaster while open mode is unsafe: never reaches the agent
             logger.info("Twitch: Backseat winner %d (%d of %d votes); dispatching to Hermes", res.winner, res.votes, res.total)
             message_id = f"backseat-{int(time.time() * 1000)}"
             await self._dispatch(channel, vote.starter_id, vote.starter_name, message_id,
@@ -509,28 +576,54 @@ def _guard_pre_tool_call(tool_name: str = "", **kwargs):
     return {"action": "block", "message": "This tool is not available in Twitch chat."}
 
 
-def _warn_unsafe_config() -> None:
-    """Log (never edit) config that leaves viewer turns less locked down than the adapter intends."""
+def _read_config() -> Optional[dict]:
     try:
         from hermes_cli.config import load_config_readonly
-        cfg = load_config_readonly() or {}
+        return load_config_readonly() or {}
     except Exception:
+        return None
+
+
+def _pinned(cfg: dict) -> bool:
+    pin = (cfg.get("platform_toolsets") or {}).get("twitch")
+    return isinstance(pin, list) and "no_mcp" in pin and all(str(x) in SAFE_TOOLSETS for x in pin)
+
+
+def _memory_off(cfg: dict) -> bool:
+    mem = cfg.get("memory") or {}
+    return isinstance(mem, dict) and mem.get("memory_enabled") is False and mem.get("user_profile_enabled") is False
+
+
+def _open_mode_check() -> tuple:
+    """(ok, reason): is it safe to let ANY viewer start an agent turn? Needs memory.memory_enabled and
+    memory.user_profile_enabled both false (no MEMORY/USER in the prompt) and platform_toolsets.twitch pinned to
+    [search, no_mcp]. An unreadable config counts as unsafe (fail closed)."""
+    cfg = _read_config()
+    if cfg is None:
+        return False, "the Hermes config could not be read"
+    problems = []
+    if not _memory_off(cfg):
+        problems.append("memory.memory_enabled and memory.user_profile_enabled must both be false")
+    if not _pinned(cfg):
+        problems.append("platform_toolsets.twitch must be pinned to [search, no_mcp]")
+    return (not problems), "; ".join(problems)
+
+
+def _warn_unsafe_config() -> None:
+    """Log (never edit) config that leaves viewer turns less locked down than the adapter intends."""
+    cfg = _read_config()
+    if cfg is None:
         return
     try:
-        pin = (cfg.get("platform_toolsets") or {}).get("twitch")
-        pinned = isinstance(pin, list) and "no_mcp" in pin and all(str(x) in SAFE_TOOLSETS for x in pin)
-        if not pinned:
+        if not _pinned(cfg):
             logger.warning("platform_toolsets.twitch is not pinned to [search, no_mcp]; viewer turns may get full tools "
                            "if the adapter is unresolved (the pre_tool_call guard still blocks everything but web search)")
-        gw = ((cfg.get("gateway") or {}).get("platforms") or {})
-        skip = bool(isinstance(gw, dict) and (gw.get("twitch") or {}).get("skip_context_files"))
-        mem = cfg.get("memory") or {}
-        mem_on = not (isinstance(mem, dict) and mem.get("memory_enabled") is False and mem.get("user_profile_enabled") is False)
-        if not skip or mem_on:
-            logger.warning("Twitch viewer turns can see the owner's context: Hermes injects SOUL.md/AGENTS.md "
-                           "(unless gateway.platforms.twitch.skip_context_files: true) and MEMORY.md/USER.md "
+        if not _memory_off(cfg):
+            logger.warning("Twitch viewer turns can see the owner's context: Hermes injects MEMORY.md/USER.md "
                            "(unless memory.memory_enabled and memory.user_profile_enabled are false) into every "
-                           "session's system prompt, and a plugin cannot switch that off")
+                           "session's system prompt, and gateway sessions keep SOUL.md even with skip_context_files "
+                           "(Hermes 0.23.x). Run the Twitch bot in its own Hermes profile with an empty SOUL.md and "
+                           "no memory (see the README)")
     except Exception:
         logger.debug("Twitch: config check failed", exc_info=True)
 
@@ -553,8 +646,9 @@ def is_connected(config) -> bool:
 def _env_enablement() -> Optional[dict]:
     """Seed ``PlatformConfig.extra`` from env before adapter construction (None = not configured).
 
-    Viewers are allowed to talk to the bot by default (``allowed_users: ["*"]``) because the Twitch
-    toolset is locked to web search; set TWITCH_ALLOW_ALL_USERS=false (and TWITCH_ALLOWED_USERS) to restrict.
+    Private by default: the gateway allowlist is only TWITCH_ALLOWED_USERS (the adapter adds the broadcaster's id
+    when it sees the broadcaster badge). ``allowed_users: ["*"]`` is seeded only when the owner opts in with
+    TWITCH_ALLOW_ALL_USERS=true; the adapter then still refuses non-broadcaster turns on an unsafe config.
     """
     token = str(_get_scoped_secret("TWITCH_TOKEN", "") or "").strip()
     channel = _clean_channel(str(_get_scoped_secret("TWITCH_CHANNEL", "") or ""))
@@ -566,11 +660,13 @@ def _env_enablement() -> Optional[dict]:
         ("TWITCH_VOTE_SECONDS", "vote_seconds", float),
         ("TWITCH_MAX_CONCURRENT", "max_concurrent", int),
     ))  # no home channel on purpose: Hermes must never treat public chat as a delivery target
-    allow_all = str(_get_scoped_secret("TWITCH_ALLOW_ALL_USERS", "") or "").strip().lower()
+    ids = _parse_ids(_get_scoped_secret("TWITCH_ALLOWED_USERS", ""))
     # notice_delivery=private routes gateway setup/operational notices to send_private_notice (logged, not posted)
     extra = {"channel": channel, "notice_delivery": "private", **seed}
-    if allow_all not in _FALSY:
+    if _is_open(_get_scoped_secret("TWITCH_ALLOW_ALL_USERS", ""), ids):
         extra["allowed_users"] = ["*"]
+    elif ids:
+        extra["allowed_users"] = sorted(ids)
     return extra
 
 
