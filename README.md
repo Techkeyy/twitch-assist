@@ -92,9 +92,14 @@ hermes -p twitch plugins install Techkeyy/twitch-assist#twitch_assist --enable
 hermes -p twitch config set TWITCH_TOKEN <your chat token>
 hermes -p twitch config set TWITCH_CHANNEL <your channel, no #>
 
-# 6. Run it, then warm it up with one !ask of your own before you go live
-hermes -p twitch gateway run
+# 6. Run the host gateway (no -p). On Hermes 0.23 one gateway per machine serves every profile,
+#    and it connects Twitch with the twitch profile's settings: the log shows "twitch connected (profile: twitch)".
+#    Do not also set TWITCH_CHANNEL in your main profile, or two profiles will try to join the same channel.
+#    Warm it up with one !ask of your own before you go live.
+hermes gateway run
 ```
+
+I ran exactly these steps on my own machine (Hermes 0.23.0, Windows): `hermes -p twitch gateway run` is refused with "Profile 'twitch' does not get a gateway of its own", and the plain `hermes gateway run` connected Twitch for the twitch profile and answered a viewer's `!ask` from that profile's own session (empty SOUL.md, memory off).
 
 If your main profile also has `TWITCH_TOKEN` and `TWITCH_CHANNEL` set, remove them there (or stop that gateway) so two gateways do not fight over the same channel.
 
@@ -243,6 +248,7 @@ I built this against Hermes v0.23.0 on native Windows. Besides the surfaces list
 - `hermes plugins install` rejects local paths (a Git URL, `owner/repo` and `owner/repo#subdir` work), so local development needs a junction into the plugins folder.
 - `hermes plugins list` blocks in a non-interactive shell.
 - The first turn after a gateway start had a gap of about 43 s before agent init: 60.9 s cold, 2.8 s for the next question.
+- `hermes profile create --clone` does not copy messaging variables such as `TWITCH_TOKEN`, and a profile gets no gateway of its own: the single host gateway (`hermes gateway run`) serves every profile and reports `twitch connected (profile: twitch)`.
 - Session metadata keys are restricted, so platform sender facts cannot ride on `MessageEvent.metadata`.
 - A plugin cannot set a per-platform memory or context-file policy, and cannot set a default platform toolset. That is why the privacy settings and the toolset pin live in the Twitch profile's `config.yaml`, with a guard hook as the backstop.
 
