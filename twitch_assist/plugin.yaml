@@ -1,7 +1,7 @@
 name: twitch-assist
 label: Twitch
 kind: platform
-version: 0.3.1
+version: 0.3.0
 requires_hermes: ">=0.23.0"
 description: >
   Twitch chat platform adapter for Hermes Agent. Private by default (broadcaster and TWITCH_ALLOWED_USERS only). Joins a streamer's Twitch chat as a co-host and
